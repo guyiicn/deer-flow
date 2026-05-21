@@ -1,0 +1,85 @@
+# Phase 1 fact-check pipeline config snippet
+#
+# This file documents the config.yaml additions required to enable the
+# fact-check pipeline. The actual config.yaml in deer-flow root is
+# gitignored (per-deployment config), so users must MANUALLY merge these
+# blocks into their config.yaml.
+#
+# Merge points:
+#   - models:        add gpt-4o model entry
+#   - tool_groups:   add 'verify' group
+#   - tools:         add verify_numbers entry
+#   - subagents:     add fact-checker-sonnet + fact-checker-gpt under custom_agents
+
+# ============================================================================
+# Models (under top-level `models:` list)
+# ============================================================================
+models_addition:
+  - name: gpt-4o
+    display_name: GPT-4o (Fact-Check Auditor)
+    use: langchain_openai:ChatOpenAI
+    model: gpt-4o
+    api_key: $OPENAI_API_KEY
+    request_timeout: 600.0
+    max_retries: 2
+    max_tokens: 16000
+    temperature: 0.7
+    supports_vision: true
+
+# ============================================================================
+# Tool groups (add to top-level `tool_groups:` list)
+# ============================================================================
+tool_groups_addition:
+  - name: verify
+
+# ============================================================================
+# Tools (add to top-level `tools:` list)
+# ============================================================================
+tools_addition:
+  - name: verify_numbers
+    group: verify
+    use: deerflow.community.factcheck.verify_numbers_tool:verify_numbers_tool
+
+# ============================================================================
+# Subagents (merge into top-level `subagents.custom_agents`)
+# ============================================================================
+subagents_addition:
+  custom_agents:
+
+    fact-checker-sonnet:
+      description: "Phase 1: same-provider first-pass verification using Claude Sonnet 4.6"
+      model: claude-sonnet-4-6
+      tool_groups: [web, verify]
+      disallowed_tools: [ask_clarification]
+      max_turns: 30
+      timeout_seconds: 600
+      skills: []
+      system_prompt: |
+        # (Full system_prompt — see deployed config.yaml or fact-checker-skill SKILL.md)
+        # Key directive: call verify_numbers for every numerical claim;
+        # apply CRITICAL CLASSIFICATION RULE; output JSON verdict.
+
+    fact-checker-gpt:
+      description: "Phase 1: cross-provider second-pass using gpt-4o (PoC #4 strict 5/5)"
+      model: gpt-4o
+      tool_groups: [web, verify]
+      disallowed_tools: [ask_clarification]
+      max_turns: 30
+      timeout_seconds: 600
+      skills: []
+      system_prompt: |
+        # (Full system_prompt — second-pass auditor; emphasizes multi-entity
+        # claim awareness and direction reversal detection)
+
+# ============================================================================
+# Validation after merge
+# ============================================================================
+# After merging into config.yaml + gateway restart, smoke-test:
+#
+#   deerflow new "Call task tool with subagent_type='fact-checker-sonnet' \
+#     and prompt='Verify this single claim: \"GPT-5.5 priced at \$4/\$20 per MTok \
+#     [citation:OpenRouter GPT-5.5](https://openrouter.ai/openai/gpt-5.5)\". \
+#     section_id=test'. Return the JSON." --model claude-opus-4-7 --no-tg
+#
+# Expected: verdict='unsupported' with fail_reason='number_missing_in_source'.
+# Anything else → debug verify_numbers tool or Jina connectivity.
