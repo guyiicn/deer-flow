@@ -108,6 +108,14 @@ def _find_usage_recorder(runtime: Any) -> Any | None:
     callbacks = config.get("callbacks", [])
     if not callbacks:
         return None
+    # Handle both list[BaseCallbackHandler] and CallbackManager / AsyncCallbackManager
+    # The CallbackManager case happens when the subagent is invoked from within a
+    # LangGraph node — `config["callbacks"]` is the parent's manager object,
+    # whose individual handlers live in `.handlers`.
+    if hasattr(callbacks, "handlers"):
+        callbacks = callbacks.handlers
+    if not hasattr(callbacks, "__iter__"):
+        return None
     for cb in callbacks:
         if hasattr(cb, "record_external_llm_usage_records"):
             return cb
