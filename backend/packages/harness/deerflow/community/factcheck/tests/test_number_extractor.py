@@ -89,16 +89,41 @@ def test_number_in_source_missing():
 def test_number_in_source_close_but_wrong():
     """PoC #4 case 5 — $3 claim vs $3.75 source.
 
-    Strict mode (tolerance=0): $3 alone IS a substring of $3.75 text.
-    But the bare numeric value '3' will match against '3' in '3.75'.
-
-    This test documents current behavior; if it's too lenient, we'll
-    tighten in Phase 1 polish.
+    With Phase 1 strict matching: "$3" pattern uses word boundary that
+    rejects matching inside "$3.75" → returns False (correctly flagged).
     """
     claim = extract_numbers("Pricing $3 input.")[0]
-    # The claim string is "$3" but with bare-value matching, "3" appears in "3.75"
     source_with_375 = "Actual pricing is $3.75 input."
-    # Acknowledge this is a known limitation; the test documents it
-    result = number_in_source(claim, source_with_375)
-    # Either result is acceptable for now; test pinpoints the actual behavior
-    assert result in (True, False)
+    assert number_in_source(claim, source_with_375) is False, \
+        "$3 should NOT match $3.75 source under strict matching"
+
+
+def test_number_in_source_dollar_4_not_in_5():
+    """PoC #4 case 2 — $4 claim vs $5 source.
+
+    Real failure observed in Phase 1 Day 1 smoke test: bare-value fallback
+    matched digit 4 anywhere in source. Strict fix: $4 must not match
+    a source whose only dollar value is $5 (even if "4" appears elsewhere
+    in dates / IDs).
+    """
+    claim = extract_numbers("GPT-5.5 priced at $4 per MTok.")[0]
+    source_with_5 = "Pricing is $5 per 1M tokens. Released April 23 2026 with 4x multiplier."
+    # Source has "4x" but no "$4" — strict matching must return False
+    assert number_in_source(claim, source_with_5) is False, \
+        "$4 must NOT match a source containing only $5 (even with bare 4 elsewhere)"
+
+
+def test_number_in_source_percentage_strict():
+    """8% claim vs source with 80%, 18%, 12-27% — must not false-positive."""
+    claim = extract_numbers("Cost dropped ~8%.")[0]
+    source_no_8 = "Costs increased 12-27% on average. Some workloads saw 80% gains."
+    assert number_in_source(claim, source_no_8) is False, \
+        "8% must not match 80% or 12-27% or 18%"
+
+
+def test_number_in_source_percentage_match():
+    """8% claim vs source with explicit 8% — must match."""
+    claim = extract_numbers("Cost dropped ~8%.")[0]
+    source_with_8 = "The discount averaged 8% across all customers."
+    assert number_in_source(claim, source_with_8) is True, \
+        "8% should match source containing standalone 8%"

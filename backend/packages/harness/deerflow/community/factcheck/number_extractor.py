@@ -108,22 +108,62 @@ def extract_numbers(text: str, window_chars: int = 50) -> list[NumberClaim]:
 
 
 def number_in_source(number_claim: NumberClaim, source_text: str, tolerance: float = 0.0) -> bool:
-    """Check if the number from claim appears in source_text.
+    """Check if the claim's number + unit appears in source_text.
 
-    By default exact-match on normalized form. With tolerance>0, allow numeric
-    fuzzy match (e.g., $3 vs $3.05 with tolerance=0.05 ≈ 1.7% diff).
+    Algorithm (Phase 1):
+        1. Build a regex from claim.raw that requires WORD BOUNDARIES on both sides
+           of the number, with the currency/unit affix attached.
+           - "$4"   → r"\\$4(?!\\d|\\.\\d)"      (no extending digits or decimal)
+           - "8%"   → r"\\b8\\s*%"
+           - "12-27%" → r"\\b12\\s*[-–~]\\s*27\\s*%"
+        2. If word-boundary regex finds match → True.
+        3. NO bare-digit fallback — that produced false positives in Phase 1
+           Day 1 smoke test ($4 matched bare digit 4 in source containing $5).
 
-    For Phase 1: tolerance=0 (strict). PoC #4 case 5 showed $3 vs $3.75
-    must be flagged as mismatch, not tolerated.
+    For PoC #4 case 5 ($3 vs $3.75): "$3" pattern is r"\\$3(?!\\d|\\.\\d)" — refuses
+    to match inside "$3.75", correctly flags as missing.
     """
-    norm_source = _normalize(source_text)
-    if number_claim.normalized in norm_source:
-        return True
-    # Extract bare numeric value (first number in the claim) and search by value
-    val_match = re.search(r"\d+(?:\.\d+)?", number_claim.raw)
-    if val_match:
-        val_str = val_match.group()
-        # Look for that bare value anywhere in source (loose check)
-        if val_str in source_text:
-            return True
-    return False
+    val_match = re.search(r"(\d+(?:\.\d+)?(?:\s*[-–~]\s*\d+(?:\.\d+)?)?)", number_claim.raw)
+    if val_match is None:
+        return False
+    value_str = val_match.group(1)
+    # Detect prefix (currency) and suffix (unit) in claim
+    raw = number_claim.raw
+    prefix = ""
+    if raw.startswith("$") or raw.startswith("US$"):
+        prefix = r"US?\$"
+    elif raw.startswith("¥"):
+        prefix = "¥"
+    elif raw.startswith("~") or raw.lower().startswith("approximately") or raw.lower().startswith("around"):
+        prefix = ""  # ignore approximation prefix for matching
+
+    # Find suffix (token after the numeric value in the claim)
+    after_value = raw[val_match.end():].strip()
+    suffix_pattern = ""
+    if after_value.startswith("%"):
+        suffix_pattern = r"\s*%"
+    elif re.match(r"^\s*(?:K|M|B)(?:\s*(?:tokens?|ctx|context|window)?)?\b", after_value, re.IGNORECASE):
+        # Token count like "200K tokens"
+        m = re.match(r"^\s*([KMB])", after_value, re.IGNORECASE)
+        if m:
+            suffix_pattern = r"\s*" + m.group(1) + r"\b"
+    elif re.match(r"^\s*[xX×]", after_value):
+        suffix_pattern = r"\s*[xX×]"
+    elif re.match(r"^\s*(?:/|per)\s*(?:M|MTok|million|month|year)", after_value, re.IGNORECASE):
+        # Per-M pricing — matching the value with /M or per-M context
+        suffix_pattern = r"\s*(?:/\s*M|per\s+M)"
+
+    # Build the value regex: escape special chars in value_str, allow flex on hyphen/spaces
+    value_re = re.escape(value_str).replace(r"-", r"\s*[-–~]\s*").replace(r"\ ", r"\s*")
+
+    pattern_str = prefix + value_re + suffix_pattern
+    # Word boundary on the right unless suffix already consumed it
+    if not suffix_pattern:
+        # Prevent matching as a prefix of a longer number (e.g., "3" inside "3.75")
+        pattern_str += r"(?!\d|\.\d)"
+
+    try:
+        return bool(re.search(pattern_str, source_text, re.IGNORECASE))
+    except re.error:
+        # If regex compilation fails for weird input, fall back to normalized substring
+        return number_claim.normalized in _normalize(source_text)
