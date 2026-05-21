@@ -11,10 +11,13 @@ _api_key_warned = False
 class JinaClient:
     async def crawl(self, url: str, return_format: str = "html", timeout: int = 10) -> str:
         global _api_key_warned
+        # NOTE: Do NOT send X-Timeout header. Empirically (2026-05-20) Jina holds the
+        # connection open for the full X-Timeout value rather than returning as soon
+        # as the page is fetched, causing client-side ReadTimeout. The `timeout=`
+        # parameter on the httpx request below is what enforces the upper bound.
         headers = {
             "Content-Type": "application/json",
             "X-Return-Format": return_format,
-            "X-Timeout": str(timeout),
         }
         if os.getenv("JINA_API_KEY"):
             headers["Authorization"] = f"Bearer {os.getenv('JINA_API_KEY')}"
