@@ -313,6 +313,12 @@ def _build_middlewares(
     if custom_middlewares:
         middlewares.extend(custom_middlewares)
 
+    # PoC #3 — CitationMiddleware (mock unverified-URL deny)
+    # Phase 0 only; remove before merge to master.
+    from deerflow.community.factcheck.citation_middleware_poc import CitationMiddlewarePoC
+    middlewares.append(CitationMiddlewarePoC())
+    logger.info("PoC #3 CitationMiddlewarePoC registered (mock denies openrouter.ai URLs)")
+
     # ClarificationMiddleware should always be last
     middlewares.append(ClarificationMiddleware())
     return middlewares
