@@ -429,8 +429,17 @@ def _make_lead_agent(config: RunnableConfig, *, app_config: AppConfig):
     # Custom agents can update their own SOUL.md / config via update_agent.
     # The default agent (no agent_name) does not see this tool.
     extra_tools = [update_agent] if agent_name else []
-    # Default lead agent (unchanged behavior)
-    tools = get_available_tools(model_name=model_name, groups=agent_config.tool_groups if agent_config else None, subagent_enabled=subagent_enabled, app_config=resolved_app_config)
+    # Default lead agent tool_groups (Phase 2 Day 10 hard fix):
+    # Excludes `verify` group so main agent CANNOT call verify_numbers
+    # directly — that tool is reserved for fact-checker-sonnet/gpt
+    # subagents (their tool_groups = [web, verify] in subagents config).
+    # Day 9/10 D2/D3 evidence: agent bypassed §8 protocol by calling
+    # verify_numbers directly, getting raw level_b signals without going
+    # through SKILL.md classification rules + multi-entity awareness +
+    # gpt escalation table. Restricting tool access forces protocol use.
+    DEFAULT_LEAD_AGENT_TOOL_GROUPS = ["web", "file:read", "file:write", "bash"]
+    effective_groups = agent_config.tool_groups if agent_config else DEFAULT_LEAD_AGENT_TOOL_GROUPS
+    tools = get_available_tools(model_name=model_name, groups=effective_groups, subagent_enabled=subagent_enabled, app_config=resolved_app_config)
     return create_agent(
         model=create_chat_model(name=model_name, thinking_enabled=thinking_enabled, reasoning_effort=reasoning_effort, app_config=resolved_app_config),
         tools=filter_tools_by_skill_allowed_tools(tools + extra_tools, skills_for_tool_policy),
