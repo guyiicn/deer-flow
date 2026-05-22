@@ -1,4 +1,6 @@
-"""Phase 2 P0-1 Tier 2: fail-fast safety net for orphan tool_use blocks
+"""Phase 2 P0-1 Tier 2 + P1-1 escalation budget middleware.
+
+P0-1 Tier 2: fail-fast safety net for orphan tool_use blocks
 that escape DanglingToolCallMiddleware.
 
 DeerFlow's DanglingToolCallMiddleware (in agents/middlewares/) already
@@ -27,7 +29,12 @@ from typing import override
 
 from langchain.agents import AgentState
 from langchain.agents.middleware import AgentMiddleware
-from langchain.agents.middleware.types import ModelCallResult, ModelRequest, ModelResponse
+from langchain.agents.middleware.types import (
+    ModelCallResult,
+    ModelRequest,
+    ModelResponse,
+    ToolCallRequest,
+)
 from langchain_core.messages import ToolMessage
 
 logger = logging.getLogger(__name__)
@@ -36,6 +43,12 @@ logger = logging.getLogger(__name__)
 # Sentinel string the wrapper greps for. Keep it stable — wrapper-side
 # detection is brittle to phrasing changes.
 ORPHAN_AFTER_PATCH_SENTINEL = "[p0-1-tier2-orphan-after-patch]"
+
+# P1-1 escalation budget enforcement
+ESCALATION_BUDGET_WARNING_SENTINEL = "[wrapper-p1-1-budget-exhausted]"
+DEFAULT_ESCALATION_BUDGET = 12   # default per-run cap on fact-checker-gpt calls
+FACT_CHECKER_GPT_SUBAGENT = "fact-checker-gpt"
+FACT_CHECKER_SONNET_SUBAGENT = "fact-checker-sonnet"
 
 
 class OrphanToolUseAfterPatchError(RuntimeError):
@@ -113,3 +126,111 @@ class OrphanRetryFailFastMiddleware(AgentMiddleware[AgentState]):
             )
             raise OrphanToolUseAfterPatchError(orphans)
         return await handler(request)
+
+
+class EscalationBudgetEnforcementMiddleware(AgentMiddleware[AgentState]):
+    """Phase 2 P1-1: enforce escalation budget by intercepting task() calls
+    to fact-checker-gpt and substituting fact-checker-sonnet when the count
+    of prior gpt escalations meets or exceeds the budget.
+
+    Spike result: no ThreadState extension needed. Count is derived live
+    from message history (each AIMessage with a task tool_call to
+    fact-checker-gpt counts as 1). Budget is a class default or
+    state['escalation_budget'] if provided by caller.
+
+    Soft enforcement: the substituted call carries the warning sentinel
+    string in its prompt so the agent sees inline that budget was hit.
+    """
+
+    def __init__(self, default_budget: int = DEFAULT_ESCALATION_BUDGET) -> None:
+        super().__init__()
+        self._default_budget = default_budget
+
+    @staticmethod
+    def _is_gpt_escalation_call(tool_call: dict) -> bool:
+        if tool_call.get("name") != "task":
+            return False
+        args = tool_call.get("args") or {}
+        if not isinstance(args, dict):
+            return False
+        return args.get("subagent_type") == FACT_CHECKER_GPT_SUBAGENT
+
+    @staticmethod
+    def _count_gpt_calls_in_history(messages) -> int:
+        """Count completed fact-checker-gpt task() invocations in the
+        message history. Each AIMessage with such a tool_call counts as 1
+        (regardless of whether the result was returned)."""
+        count = 0
+        for msg in messages or []:
+            if getattr(msg, "type", None) != "ai":
+                continue
+            for tc in (getattr(msg, "tool_calls", None) or []):
+                # Each tc is dict-like {"name": ..., "args": {...}, ...}
+                if isinstance(tc, dict):
+                    name = tc.get("name")
+                    args = tc.get("args") or {}
+                else:
+                    name = getattr(tc, "name", None)
+                    args = getattr(tc, "args", None) or {}
+                if name == "task" and isinstance(args, dict) and \
+                   args.get("subagent_type") == FACT_CHECKER_GPT_SUBAGENT:
+                    count += 1
+        return count
+
+    def _budget(self, state) -> int:
+        if state and isinstance(state, dict):
+            v = state.get("escalation_budget")
+            if isinstance(v, int) and v > 0:
+                return v
+        return self._default_budget
+
+    def _maybe_substitute(self, request: ToolCallRequest) -> ToolCallRequest:
+        """Return a (possibly modified) request — substitutes gpt with
+        sonnet + warning prefix if budget exceeded."""
+        if not self._is_gpt_escalation_call(request.tool_call):
+            return request
+        state_dict = getattr(request, "state", None)
+        if state_dict is None:
+            return request
+        messages = state_dict.get("messages", []) if isinstance(state_dict, dict) else []
+        used = self._count_gpt_calls_in_history(messages)
+        budget = self._budget(state_dict)
+        if used < budget:
+            return request   # under budget, let it through
+
+        original_args = request.tool_call.get("args") or {}
+        original_prompt = original_args.get("prompt", "")
+        warning = (
+            f"{ESCALATION_BUDGET_WARNING_SENTINEL} Escalation budget "
+            f"exhausted ({used}/{budget} gpt calls used). The wrapper "
+            f"redirected this audit to fact-checker-sonnet instead. "
+            f"Treat the verdict accordingly — sonnet may miss what gpt "
+            f"would have caught (cross-provider blind spots).\n\n"
+        )
+        modified_args = {
+            **original_args,
+            "subagent_type": FACT_CHECKER_SONNET_SUBAGENT,
+            "prompt": warning + original_prompt,
+        }
+        modified_call = {**request.tool_call, "args": modified_args}
+        logger.warning(
+            f"{ESCALATION_BUDGET_WARNING_SENTINEL} substituted gpt→sonnet "
+            f"(history shows {used} gpt calls already, budget={budget})"
+        )
+        return request.override(tool_call=modified_call)
+
+    @override
+    def wrap_tool_call(
+        self,
+        request: ToolCallRequest,
+        handler: Callable[[ToolCallRequest], object],
+    ) -> object:
+        return handler(self._maybe_substitute(request))
+
+    @override
+    async def awrap_tool_call(
+        self,
+        request: ToolCallRequest,
+        handler: Callable[[ToolCallRequest], Awaitable[object]],
+    ) -> object:
+        return await handler(self._maybe_substitute(request))

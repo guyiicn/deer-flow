@@ -95,10 +95,17 @@ def _build_runtime_middlewares(
         # edge case where DanglingToolCallMiddleware's patch doesn't catch
         # an orphan (sanity v2 mid-stream 400 evidence). Must run AFTER
         # DanglingToolCallMiddleware so it only fires when patch failed.
-        from deerflow.community.factcheck.middleware import OrphanRetryFailFastMiddleware
+        from deerflow.community.factcheck.middleware import (
+            EscalationBudgetEnforcementMiddleware,
+            OrphanRetryFailFastMiddleware,
+        )
 
         middlewares.append(DanglingToolCallMiddleware())
         middlewares.append(OrphanRetryFailFastMiddleware())
+        # Phase 2 P1-1: enforce per-run escalation budget at the tool-call
+        # boundary. Order vs Orphan/Dangling middlewares doesn't matter
+        # (different hooks: wrap_tool_call vs wrap_model_call).
+        middlewares.append(EscalationBudgetEnforcementMiddleware())
 
     middlewares.append(LLMErrorHandlingMiddleware(app_config=app_config))
 
