@@ -173,3 +173,110 @@ def test_per_mtok_matches_per_million():
     claim = extract_numbers("Pricing $5 per MTok")[0]
     source_per_million = "API at $5 per million tokens"
     assert number_in_source(claim, source_per_million) is True
+
+
+# ─── Phase 2 P2-2: extended currencies + CJK + trillion + params ────────────
+def test_extract_euro_currency():
+    nums = extract_numbers("Pricing at €5 per MTok.")
+    raws = [n.raw for n in nums]
+    flat = " ".join(raws)
+    assert "€5" in flat or "5" in flat
+
+
+def test_extract_pound_currency():
+    nums = extract_numbers("Subscription is £49/month.")
+    raws = [n.raw for n in nums]
+    flat = " ".join(raws)
+    assert "£49" in flat or "49" in flat
+
+
+def test_extract_chf_currency():
+    nums = extract_numbers("Total CHF 100 per seat.")
+    raws = [n.raw for n in nums]
+    flat = " ".join(raws)
+    assert "100" in flat
+
+
+def test_extract_trillion_unit():
+    nums = extract_numbers("Trained on 1.5T tokens.")
+    raws = [n.raw for n in nums]
+    assert any("1.5T" in r for r in raws), f"expected 1.5T in {raws}"
+
+
+def test_extract_params_unit():
+    nums = extract_numbers("The model has 70B parameters.")
+    raws = [n.raw for n in nums]
+    assert any("70B" in r for r in raws), f"expected 70B in {raws}"
+
+
+def test_extract_cjk_yi_yuan():
+    """1.5 亿元 = 150M yuan"""
+    nums = extract_numbers("市值达 1.5 亿元.")
+    raws = [n.raw for n in nums]
+    flat = " ".join(raws)
+    assert "1.5" in flat and "亿" in flat
+
+
+def test_extract_cjk_wan_no_currency():
+    """100 万 tokens (no currency unit) — should still be extracted."""
+    nums = extract_numbers("处理了 100 万 tokens 的内容.")
+    raws = [n.raw for n in nums]
+    flat = " ".join(raws)
+    assert "100" in flat and "万" in flat
+
+
+def test_extract_cjk_qianwan():
+    """千万 = 10 million"""
+    nums = extract_numbers("用户数 3 千万")
+    raws = [n.raw for n in nums]
+    flat = " ".join(raws)
+    assert "3" in flat and "千万" in flat
+
+
+def test_extract_yuan_per_month():
+    """49 元/月"""
+    nums = extract_numbers("订阅 49 元/月.")
+    raws = [n.raw for n in nums]
+    flat = " ".join(raws)
+    assert "49" in flat
+
+
+def test_extract_per_ten_thousand():
+    """5 ‱ = 5 per ten-thousand (Chinese finance notation)"""
+    nums = extract_numbers("利率 5 ‱")
+    raws = [n.raw for n in nums]
+    flat = " ".join(raws)
+    assert "5" in flat
+
+
+# ─── number_in_source: extended currencies ──────────────────────────────────
+def test_euro_in_source_match():
+    claim = extract_numbers("Pricing at €5 per MTok.")[0]
+    source = "European pricing is €5 per million tokens."
+    assert number_in_source(claim, source) is True
+
+
+def test_pound_in_source_match():
+    claim = extract_numbers("Subscription £49/month.")[0]
+    source = "Monthly plan £49 per month."
+    assert number_in_source(claim, source) is True
+
+
+def test_trillion_param_match():
+    claim = extract_numbers("Trained on 1.5T tokens.")[0]
+    source = "The training corpus comprised 1.5T tokens of text."
+    assert number_in_source(claim, source) is True
+
+
+def test_yi_yuan_match():
+    """1.5 亿元 in claim, "150 million yuan" in source — should fall through
+    to regex match on 1.5 亿元 in source (if present), else fail honestly."""
+    claim = extract_numbers("市值 1.5 亿元.")[0]
+    source = "公司市值已达 1.5 亿元 (约合 150 million USD)."
+    assert number_in_source(claim, source) is True
+
+
+def test_wan_token_match():
+    claim = extract_numbers("100 万 tokens")[0]
+    source = "处理 100 万 tokens 的输入."
+    assert number_in_source(claim, source) is True
