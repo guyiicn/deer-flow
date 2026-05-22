@@ -91,8 +91,14 @@ def _build_runtime_middlewares(
 
     if include_dangling_tool_call_patch:
         from deerflow.agents.middlewares.dangling_tool_call_middleware import DanglingToolCallMiddleware
+        # Phase 2 P0-1 Tier 2: safety net for the rare deep-conversation
+        # edge case where DanglingToolCallMiddleware's patch doesn't catch
+        # an orphan (sanity v2 mid-stream 400 evidence). Must run AFTER
+        # DanglingToolCallMiddleware so it only fires when patch failed.
+        from deerflow.community.factcheck.middleware import OrphanRetryFailFastMiddleware
 
         middlewares.append(DanglingToolCallMiddleware())
+        middlewares.append(OrphanRetryFailFastMiddleware())
 
     middlewares.append(LLMErrorHandlingMiddleware(app_config=app_config))
 
