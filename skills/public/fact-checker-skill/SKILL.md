@@ -5,7 +5,14 @@ description: |
   cited sources. Used by fact-checker-sonnet and fact-checker-gpt
   subagents. Defines the per-claim verification workflow, output schema,
   and strict classification rules.
-allowed-tools: [web_search, web_fetch, verify_numbers]
+# Phase 2 Day 3 P0-2 fix: removed `allowed-tools: [...]` because
+# tool_policy.py applies the union to ALL agents that load this skill
+# (incl. lead agent) — stripped write_file / task / read_file etc from
+# main agent's tool catalog, making it appear "not exposed". Subagent
+# fact-checker-sonnet/gpt are already restricted independently via their
+# config's `tool_groups: [web, verify]`, so removing this here doesn't
+# change subagent behavior. Verified: 10/10 sanity Day 2 had 0 file writes,
+# Day 3 single probe confirmed missing tools in request.tools.
 ---
 
 # Fact-Checker Skill — Phase 1
