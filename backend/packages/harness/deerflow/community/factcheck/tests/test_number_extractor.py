@@ -127,3 +127,49 @@ def test_number_in_source_percentage_match():
     source_with_8 = "The discount averaged 8% across all customers."
     assert number_in_source(claim, source_with_8) is True, \
         "8% should match source containing standalone 8%"
+
+
+# ─── Day 5 Bug A regression: display-equivalent value variants ──────────────
+def test_dollar_8_dot_00_matches_dollar_8_in_source():
+    """Bug A from Day 5 sanity: claim '$8.00 per million' must match source
+    that says '$8/million'. The trailing zeros are display, not semantic."""
+    claim = extract_numbers("Pricing was $8.00 per million input tokens.")[0]
+    source_with_int = "API pricing: $8/million input, $24/million output."
+    assert number_in_source(claim, source_with_int) is True, \
+        "$8.00 with /M unit must match source containing $8/million"
+
+
+def test_dollar_22_dot_50_matches_22_50_per_million():
+    """Sanity Day 5 second case: $22.50/MTok claim vs $22.50/million source."""
+    claim = extract_numbers("Output: $22.50 per MTok.")[0]
+    source = "For >200K prompts, output rates rise to $22.50/million tokens."
+    assert number_in_source(claim, source) is True
+
+
+def test_dollar_3_dot_00_matches_dollar_3():
+    claim = extract_numbers("Input: $3.00 / MTok")[0]
+    source = "$3/M input, $15/M output"
+    assert number_in_source(claim, source) is True
+
+
+def test_value_variants_still_blocks_3_vs_3_75():
+    """Regression guard: the variant change must NOT regress PoC #4 case 5.
+    Claim $3 (no decimal) must still NOT match source containing only $3.75."""
+    claim = extract_numbers("Pricing $3 input.")[0]
+    source = "Actual pricing is $3.75 input."
+    assert number_in_source(claim, source) is False, \
+        "$3 must NOT match $3.75 (word-boundary protection)"
+
+
+def test_percent_8_dot_0_matches_8_percent():
+    """Variants apply to percent suffix too: 8.0% matches 8%."""
+    claim = extract_numbers("Cost dropped 8.0%.")[0]
+    source = "The discount averaged 8% across all customers."
+    assert number_in_source(claim, source) is True
+
+
+def test_per_mtok_matches_per_million():
+    """Unit equivalence: 'per MTok' should match 'per million' source."""
+    claim = extract_numbers("Pricing $5 per MTok")[0]
+    source_per_million = "API at $5 per million tokens"
+    assert number_in_source(claim, source_per_million) is True

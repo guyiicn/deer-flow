@@ -107,21 +107,46 @@ def extract_numbers(text: str, window_chars: int = 50) -> list[NumberClaim]:
     return found
 
 
+def _value_variants(value_str: str) -> list[str]:
+    """Return a list of equivalent numeric strings for source matching.
+
+    Handles the Day 5 sanity-test false negative: claim "$8.00" must
+    match source "$8" (trailing zeros are display, not semantic).
+    Likewise "8.0%" matches "8%", "3.50" matches "3.5".
+
+    Returns [original, stripped] — caller alts them together in the regex.
+    """
+    variants = {value_str}
+    # Strip trailing zeros after decimal: 8.00 → 8.0 → 8 ; 22.50 → 22.5 ; 3.10 → 3.1
+    if "." in value_str:
+        stripped = value_str.rstrip("0").rstrip(".")
+        if stripped and stripped != value_str:
+            variants.add(stripped)
+        # Also add the integer-only form for cases like 8.00 → 8 even when
+        # an interior digit is non-zero we keep that variant too. The set
+        # already handles dedupe.
+    return sorted(variants, key=len, reverse=True)   # match longer first
+
+
 def number_in_source(number_claim: NumberClaim, source_text: str, tolerance: float = 0.0) -> bool:
     """Check if the claim's number + unit appears in source_text.
 
-    Algorithm (Phase 1):
-        1. Build a regex from claim.raw that requires WORD BOUNDARIES on both sides
-           of the number, with the currency/unit affix attached.
-           - "$4"   → r"\\$4(?!\\d|\\.\\d)"      (no extending digits or decimal)
-           - "8%"   → r"\\b8\\s*%"
-           - "12-27%" → r"\\b12\\s*[-–~]\\s*27\\s*%"
-        2. If word-boundary regex finds match → True.
-        3. NO bare-digit fallback — that produced false positives in Phase 1
-           Day 1 smoke test ($4 matched bare digit 4 in source containing $5).
+    Algorithm (Phase 1, post Day-5 sanity tuning):
+        1. Extract value + currency prefix + unit suffix from claim.raw.
+        2. Generate value variants for display-equivalent forms
+           ("$8.00" matches "$8"; "8.0%" matches "8%"; see _value_variants).
+        3. Generate suffix variants for per-million pricing
+           ("/M" matches "/million" matches "per MTok" matches "per million").
+        4. Build a regex with word-boundary protection on both sides.
+        5. If match → True.
+        6. NO bare-digit fallback — produced false positives in Day 1 smoke
+           ($4 matched bare digit 4 in source containing $5).
 
-    For PoC #4 case 5 ($3 vs $3.75): "$3" pattern is r"\\$3(?!\\d|\\.\\d)" — refuses
-    to match inside "$3.75", correctly flags as missing.
+    Examples:
+      claim "$3"           source "$3.75 input"        → False (Day-1 PoC #4 case 5)
+      claim "$8.00 / MTok" source "$8/million input"   → True  (Day 5 Bug A)
+      claim "$22.50 / MTok" source "$22.50/million"    → True
+      claim "8%"           source "80% gains, 18%"     → False (word boundary)
     """
     val_match = re.search(r"(\d+(?:\.\d+)?(?:\s*[-–~]\s*\d+(?:\.\d+)?)?)", number_claim.raw)
     if val_match is None:
@@ -131,7 +156,11 @@ def number_in_source(number_claim: NumberClaim, source_text: str, tolerance: flo
     raw = number_claim.raw
     prefix = ""
     if raw.startswith("$") or raw.startswith("US$"):
-        prefix = r"US?\$"
+        # Day 5 latent bug fix: was r"US?\$" which requires U+optional-S+$
+        # → forced every $-claim through the fallback branch (worked for
+        # negative tests by accident; broke as soon as Bug A unit test
+        # exercised a real positive match).
+        prefix = r"(?:US)?\$"
     elif raw.startswith("¥"):
         prefix = "¥"
     elif raw.startswith("~") or raw.lower().startswith("approximately") or raw.lower().startswith("around"):
@@ -150,11 +179,18 @@ def number_in_source(number_claim: NumberClaim, source_text: str, tolerance: flo
     elif re.match(r"^\s*[xX×]", after_value):
         suffix_pattern = r"\s*[xX×]"
     elif re.match(r"^\s*(?:/|per)\s*(?:M|MTok|million|month|year)", after_value, re.IGNORECASE):
-        # Per-M pricing — matching the value with /M or per-M context
-        suffix_pattern = r"\s*(?:/\s*M|per\s+M)"
+        # Per-M pricing — match any variant: "/M", "/MTok", "/million",
+        # "per M", "per MTok", "per million", "per million tokens"
+        suffix_pattern = (r"\s*(?:/\s*(?:M(?:Tok)?|million)|"
+                          r"per\s+(?:M(?:Tok)?|million)(?:\s+(?:input|output)?\s*tokens?)?)")
 
-    # Build the value regex: escape special chars in value_str, allow flex on hyphen/spaces
-    value_re = re.escape(value_str).replace(r"-", r"\s*[-–~]\s*").replace(r"\ ", r"\s*")
+    # Build the value regex with display-equivalent variants ($8.00 ≡ $8)
+    variants = _value_variants(value_str)
+    value_re_parts = [
+        re.escape(v).replace(r"-", r"\s*[-–~]\s*").replace(r"\ ", r"\s*")
+        for v in variants
+    ]
+    value_re = "(?:" + "|".join(value_re_parts) + ")"
 
     pattern_str = prefix + value_re + suffix_pattern
     # Word boundary on the right unless suffix already consumed it
