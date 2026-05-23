@@ -440,6 +440,13 @@ def _make_lead_agent(config: RunnableConfig, *, app_config: AppConfig):
     DEFAULT_LEAD_AGENT_TOOL_GROUPS = ["web", "file:read", "file:write", "bash"]
     effective_groups = agent_config.tool_groups if agent_config else DEFAULT_LEAD_AGENT_TOOL_GROUPS
     tools = get_available_tools(model_name=model_name, groups=effective_groups, subagent_enabled=subagent_enabled, app_config=resolved_app_config)
+    # Phase 3 G2: remove ask_clarification from default lead agent so it
+    # can't pause mid-task to ask the user "want me to continue with X?"
+    # (D3v2 evidence: agent stopped 6/10 sections in to ask permission,
+    # leaving 4 unverified). Custom agents with their own config keep
+    # ask_clarification if they explicitly want it.
+    if agent_config is None:
+        tools = [t for t in tools if getattr(t, "name", None) != "ask_clarification"]
     return create_agent(
         model=create_chat_model(name=model_name, thinking_enabled=thinking_enabled, reasoning_effort=reasoning_effort, app_config=resolved_app_config),
         tools=filter_tools_by_skill_allowed_tools(tools + extra_tools, skills_for_tool_policy),
