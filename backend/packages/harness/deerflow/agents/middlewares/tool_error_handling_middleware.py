@@ -98,6 +98,7 @@ def _build_runtime_middlewares(
         from deerflow.community.factcheck.middleware import (
             EscalationBudgetEnforcementMiddleware,
             OrphanRetryFailFastMiddleware,
+            Section8EnforcementMiddleware,
         )
 
         middlewares.append(DanglingToolCallMiddleware())
@@ -106,6 +107,10 @@ def _build_runtime_middlewares(
         # boundary. Order vs Orphan/Dangling middlewares doesn't matter
         # (different hooks: wrap_tool_call vs wrap_model_call).
         middlewares.append(EscalationBudgetEnforcementMiddleware())
+        # Phase 3 G1: §8 protocol enforcement via system message injection
+        # when write_file lacks follow-up fact-checker task(). Runs on
+        # wrap_model_call (no conflict with budget which uses wrap_tool_call).
+        middlewares.append(Section8EnforcementMiddleware())
 
     middlewares.append(LLMErrorHandlingMiddleware(app_config=app_config))
 

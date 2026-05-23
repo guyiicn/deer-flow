@@ -1,6 +1,6 @@
-"""Phase 2 P0-1 Tier 2 + P1-1 escalation budget middleware.
+"""Phase 2/3 factcheck middlewares (3 classes in this module).
 
-P0-1 Tier 2: fail-fast safety net for orphan tool_use blocks
+P0-1 Tier 2 (Phase 2): fail-fast safety net for orphan tool_use blocks
 that escape DanglingToolCallMiddleware.
 
 DeerFlow's DanglingToolCallMiddleware (in agents/middlewares/) already
@@ -27,6 +27,8 @@ import logging
 from collections.abc import Awaitable, Callable
 from typing import override
 
+import re
+
 from langchain.agents import AgentState
 from langchain.agents.middleware import AgentMiddleware
 from langchain.agents.middleware.types import (
@@ -35,20 +37,32 @@ from langchain.agents.middleware.types import (
     ModelResponse,
     ToolCallRequest,
 )
-from langchain_core.messages import ToolMessage
+from langchain_core.messages import AIMessage, SystemMessage, ToolMessage
+from langgraph.runtime import Runtime
 
 logger = logging.getLogger(__name__)
 
 
-# Sentinel string the wrapper greps for. Keep it stable — wrapper-side
-# detection is brittle to phrasing changes.
+# P0-1 Tier 2 sentinel (Phase 2). Wrapper greps for this.
 ORPHAN_AFTER_PATCH_SENTINEL = "[p0-1-tier2-orphan-after-patch]"
 
-# P1-1 escalation budget enforcement
+# P1-1 escalation budget enforcement (Phase 2)
 ESCALATION_BUDGET_WARNING_SENTINEL = "[wrapper-p1-1-budget-exhausted]"
 DEFAULT_ESCALATION_BUDGET = 12   # default per-run cap on fact-checker-gpt calls
 FACT_CHECKER_GPT_SUBAGENT = "fact-checker-gpt"
 FACT_CHECKER_SONNET_SUBAGENT = "fact-checker-sonnet"
+
+# G1 §8 enforcement (Phase 3). Sentinel string for nag-loop detection
+# and for wrapper-side debug visibility.
+SECTION_8_ENFORCEMENT_SENTINEL = "[wrapper-p3-g1]"
+FACT_CHECKER_SUBAGENT_PREFIX = "fact-checker-"   # matches sonnet / gpt
+# Sections that legitimately don't need fact-check (URL bibliographies,
+# table of contents, etc.). Matches wrapper's EXEMPT_SECTION_IDS.
+G1_EXEMPT_SECTION_IDS = frozenset({
+    "sources", "references", "bibliography", "citations",
+    "appendix", "footnotes", "acknowledgements", "acknowledgments",
+    "table-of-contents", "toc", "index",
+})
 
 
 class OrphanToolUseAfterPatchError(RuntimeError):
@@ -234,3 +248,189 @@ class EscalationBudgetEnforcementMiddleware(AgentMiddleware[AgentState]):
         handler: Callable[[ToolCallRequest], Awaitable[object]],
     ) -> object:
         return await handler(self._maybe_substitute(request))
+
+
+# Regex to extract `## Heading` slugs from markdown content
+_G1_HEADING_RE = re.compile(r"^##\s+(.+?)\s*$", re.MULTILINE)
+_G1_SLUG_TRIM_RE = re.compile(r"[^a-z0-9一-鿿]+")
+
+
+def _g1_slugify_heading(text: str) -> str:
+    """Phase 3 G1: deterministic slug — must match wrapper's _slugify_heading
+    (deer-flow-wrapper/deerflow). CJK characters preserved (Phase 2 P3-1)."""
+    s = re.sub(r"[*`_~]", "", text or "").strip().lower()
+    s = _G1_SLUG_TRIM_RE.sub("-", s).strip("-")
+    return s or "untitled"
+
+
+class Section8EnforcementMiddleware(AgentMiddleware[AgentState]):
+    """Phase 3 G1: wrapper-side §8 protocol enforcement.
+
+    Detects orphan write_file(outputs/*.md) events in message history
+    where the main agent wrote sections but did NOT follow up with a
+    task(fact-checker-*) call within LOOKAHEAD_TURNS model turns.
+
+    Enforcement is via SYSTEM MESSAGE injection (NOT synthetic ToolMessage).
+    Phase 3 design v2 §3.2.3 explicitly rejects fake ToolMessage approach
+    because it would pollute conversation with fabricated fact-checker
+    verdict — agent would make decisions on counterfeit data.
+
+    Instead we inject a system reminder telling the agent to call
+    fact-checker-sonnet NOW for each unverified section. Agent then makes
+    the real task() call itself and gets real verdict data.
+
+    Nag-loop guard (_already_nagged_recently): if our sentinel string
+    appears in the last 4 messages, don't inject again — let the agent
+    act on the previous reminder first.
+
+    EXEMPT_SECTION_IDS handled (Sources/References etc. — same as wrapper).
+    """
+
+    LOOKAHEAD_TURNS = 3
+    NAG_LOOKBACK = 4   # messages — should cover 1-2 model turns of context
+
+    @staticmethod
+    def _extract_write_file_calls(messages: list) -> list[tuple[int, list[str]]]:
+        """Find all write_file tool_call invocations in the message history
+        targeting outputs/*.md, return list of (message_index, [section_slugs]).
+        """
+        out = []
+        for i, msg in enumerate(messages or []):
+            if getattr(msg, "type", None) != "ai":
+                continue
+            for tc in (getattr(msg, "tool_calls", None) or []):
+                if isinstance(tc, dict):
+                    name = tc.get("name")
+                    args = tc.get("args") or {}
+                else:
+                    name = getattr(tc, "name", None)
+                    args = getattr(tc, "args", None) or {}
+                if name != "write_file":
+                    continue
+                if not isinstance(args, dict):
+                    continue
+                path = args.get("path") or args.get("file_path") or ""
+                if not isinstance(path, str) or not path.endswith(".md"):
+                    continue
+                if "/outputs/" not in path.lower() and not path.lower().startswith("outputs/"):
+                    continue
+                content = args.get("content") or ""
+                slugs = [
+                    _g1_slugify_heading(h) for h in _G1_HEADING_RE.findall(content or "")
+                ]
+                # Filter exempt sections (Sources, References, etc.)
+                slugs = [s for s in slugs if s not in G1_EXEMPT_SECTION_IDS]
+                if slugs:
+                    out.append((i, slugs))
+        return out
+
+    @staticmethod
+    def _extract_fact_checked_section_ids(messages: list, from_idx: int) -> set[str]:
+        """Return section_ids that received a task(fact-checker-*) call
+        AFTER from_idx in the message history. Slug extracted from args.prompt
+        text via `section_id=<slug>` regex or from args.section_id field."""
+        kv_re = re.compile(r"section_id\s*=\s*([A-Za-z0-9一-鿿](?:[\w\-]|\.(?=[A-Za-z0-9一-鿿]))*)")
+        verified: set[str] = set()
+        for msg in messages[from_idx:]:
+            if getattr(msg, "type", None) != "ai":
+                continue
+            for tc in (getattr(msg, "tool_calls", None) or []):
+                if isinstance(tc, dict):
+                    name = tc.get("name")
+                    args = tc.get("args") or {}
+                else:
+                    name = getattr(tc, "name", None)
+                    args = getattr(tc, "args", None) or {}
+                if name != "task" or not isinstance(args, dict):
+                    continue
+                sub_t = args.get("subagent_type", "")
+                if not isinstance(sub_t, str) or not sub_t.startswith(FACT_CHECKER_SUBAGENT_PREFIX):
+                    continue
+                # Try explicit section_id arg first, then prompt regex
+                explicit = args.get("section_id")
+                if isinstance(explicit, str) and explicit:
+                    verified.add(_g1_slugify_heading(explicit))
+                    continue
+                prompt = args.get("prompt", "")
+                if isinstance(prompt, str):
+                    for m in kv_re.finditer(prompt):
+                        verified.add(_g1_slugify_heading(m.group(1)))
+        return verified
+
+    @classmethod
+    def _find_orphan_sections(cls, messages: list) -> list[str]:
+        """Identify sections that have been written to outputs/*.md but not
+        yet fact-checked within LOOKAHEAD_TURNS of their write_file event."""
+        write_events = cls._extract_write_file_calls(messages)
+        if not write_events:
+            return []
+        # All distinct section slugs ever written
+        all_written = set()
+        for _, slugs in write_events:
+            all_written.update(slugs)
+        # All sections fact-checked so far (from any write_file forward)
+        verified = cls._extract_fact_checked_section_ids(messages, 0)
+        # Orphans: written but never verified
+        return sorted(all_written - verified)
+
+    @classmethod
+    def _already_nagged_recently(cls, messages: list) -> bool:
+        """Nag-loop guard: if our sentinel appears in the last NAG_LOOKBACK
+        messages, don't inject again — let the agent act on the previous
+        reminder first."""
+        for msg in (messages or [])[-cls.NAG_LOOKBACK:]:
+            content = getattr(msg, "content", "")
+            if isinstance(content, str) and SECTION_8_ENFORCEMENT_SENTINEL in content:
+                return True
+            if isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and SECTION_8_ENFORCEMENT_SENTINEL in str(block.get("text", "")):
+                        return True
+        return False
+
+    @classmethod
+    def _build_nag_message(cls, orphan_sections: list[str]) -> SystemMessage:
+        section_list = ", ".join(orphan_sections)
+        return SystemMessage(content=(
+            f"{SECTION_8_ENFORCEMENT_SENTINEL} You wrote section(s) "
+            f"[{section_list}] but did NOT call task(subagent_type="
+            f"'fact-checker-sonnet', ...) for them. Per OUTPUT_POLICY §8, "
+            f"fact-checking EVERY section is MANDATORY before finalizing. "
+            f"Call task() for each unverified section NOW. Skipping = "
+            f"exit 33 = run invalid. Do not summarize / finalize / pause "
+            f"to ask user permission until every section has been "
+            f"fact-checked."
+        ))
+
+    @classmethod
+    def _maybe_inject(cls, request: ModelRequest) -> ModelRequest:
+        messages = list(request.messages or [])
+        if cls._already_nagged_recently(messages):
+            return request   # let prior nag take effect first
+        orphans = cls._find_orphan_sections(messages)
+        if not orphans:
+            return request   # all sections verified, nothing to do
+        nag = cls._build_nag_message(orphans)
+        # Prepend so model sees it before user-facing context
+        new_messages = [nag] + messages
+        logger.warning(
+            f"{SECTION_8_ENFORCEMENT_SENTINEL} injecting nag for unverified "
+            f"sections {orphans}"
+        )
+        return request.override(messages=new_messages)
+
+    @override
+    def wrap_model_call(
+        self,
+        request: ModelRequest,
+        handler: Callable[[ModelRequest], ModelResponse],
+    ) -> ModelCallResult:
+        return handler(self._maybe_inject(request))
+
+    @override
+    async def awrap_model_call(
+        self,
+        request: ModelRequest,
+        handler: Callable[[ModelRequest], Awaitable[ModelResponse]],
+    ) -> ModelCallResult:
+        return await handler(self._maybe_inject(request))
