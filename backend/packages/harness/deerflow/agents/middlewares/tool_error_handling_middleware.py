@@ -94,7 +94,11 @@ def _build_runtime_middlewares(
         # Phase 2 P0-1 Tier 2: safety net for the rare deep-conversation
         # edge case where DanglingToolCallMiddleware's patch doesn't catch
         # an orphan (sanity v2 mid-stream 400 evidence). Must run AFTER
-        # DanglingToolCallMiddleware so it only fires when patch failed.
+        # DanglingToolCallMiddleware AND AFTER DanglingToolCallPatch (A'.2)
+        # so it only fires when BOTH patches failed.
+        from deerflow.community.factcheck.dangling_tool_call_patch_middleware import (
+            DanglingToolCallPatchMiddleware,
+        )
         from deerflow.community.factcheck.middleware import (
             EscalationBudgetEnforcementMiddleware,
             OrphanRetryFailFastMiddleware,
@@ -102,6 +106,12 @@ def _build_runtime_middlewares(
         )
 
         middlewares.append(DanglingToolCallMiddleware())
+        # Phase 7 A'.2: generic safety net catching the content-block
+        # tool_use gap that Tier 1 misses (Tier 1 reads msg.tool_calls
+        # only). Runs AFTER Tier 1 so Tier 1 covers normalized format
+        # and A'.2 covers raw Anthropic content-block format. Both use
+        # idempotent dedupe so they don't double-patch.
+        middlewares.append(DanglingToolCallPatchMiddleware())
         middlewares.append(OrphanRetryFailFastMiddleware())
         # Phase 2 P1-1: enforce per-run escalation budget at the tool-call
         # boundary. Order vs Orphan/Dangling middlewares doesn't matter
