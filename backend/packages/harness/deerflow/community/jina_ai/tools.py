@@ -22,11 +22,14 @@ async def web_fetch_tool(url: str) -> str:
     """
     jina_client = JinaClient()
     timeout = 10
+    max_chars = 50_000
     config = get_app_config().get_tool_config("web_fetch")
     if config is not None and "timeout" in config.model_extra:
         timeout = config.model_extra.get("timeout")
+    if config is not None and "max_chars" in config.model_extra:
+        max_chars = config.model_extra.get("max_chars")
     html_content = await jina_client.crawl(url, return_format="html", timeout=timeout)
     if isinstance(html_content, str) and html_content.startswith("Error:"):
         return html_content
     article = await asyncio.to_thread(readability_extractor.extract_article, html_content)
-    return article.to_markdown()[:4096]
+    return article.to_markdown()[:max_chars]
